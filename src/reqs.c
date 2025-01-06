@@ -301,21 +301,16 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
 }
 
 /*
- * These two defines are for the SSL tunnelling.
+ * Send the appropriate response to the client to establish a
+ * connection via CONNECT method.
  */
-#define SSL_CONNECTION_RESPONSE "HTTP/1.0 200 Connection established"
-#define PROXY_AGENT "Proxy-agent: " PACKAGE "/" VERSION
-
-/*
- * Send the appropriate response to the client to establish a SSL
- * connection.
- */
-static int send_ssl_response (struct conn_s *connptr)
+static int send_connect_method_response (struct conn_s *connptr)
 {
         return write_message (connptr->client_fd,
-                              "%s\r\n"
-                              "%s\r\n"
-                              "\r\n", SSL_CONNECTION_RESPONSE, PROXY_AGENT);
+                              "HTTP/1.%u 200 Connection established\r\n"
+                              "Proxy-agent: " PACKAGE "\r\n"
+                              "\r\n", connptr->protocol.major != 1 ? 0 :
+                                      connptr->protocol.minor);
 }
 
 /*
@@ -327,8 +322,10 @@ static struct request_s *process_request (struct conn_s *connptr,
 {
         char *url;
         struct request_s *request;
-        int ret;
+        int ret, skip_trans;
         size_t request_len;
+
+        skip_trans = 0;
 
         /* NULL out all the fields so frees don't cause segfaults. */
         request =
@@ -346,8 +343,12 @@ static struct request_s *process_request (struct conn_s *connptr,
                 goto fail;
         }
 
+        /* zero-terminate the strings so they don't contain junk in error page */
+        request->method[0] = url[0] = request->protocol[0] = 0;
+
         ret = sscanf (connptr->request_line, "%[^ ] %[^ ] %[^ ]",
                       request->method, url, request->protocol);
+
         if (ret == 2 && !strcasecmp (request->method, "GET")) {
                 request->protocol[0] = 0;
 
@@ -402,6 +403,7 @@ BAD_REQUEST_ERROR:
                         }
                         safefree (url);
                         url = reverse_url;
+                        skip_trans = 1;
                 } else if (config->reverseonly) {
                         log_message (LOG_ERR,
                                      "Bad request, no mapping for '%s' found",
@@ -451,11 +453,13 @@ BAD_REQUEST_ERROR:
                 connptr->connect_method = TRUE;
         } else {
 #ifdef TRANSPARENT_PROXY
-                if (!do_transparent_proxy
-                    (connptr, hashofheaders, request, config, &url)) {
-                        goto fail;
-                }
-#else
+                if (!skip_trans) {
+                        if (!do_transparent_proxy
+                            (connptr, hashofheaders, request, config, &url))
+                                goto fail;
+                } else
+#endif
+                {
                 indicate_http_error (connptr, 501, "Not Implemented",
                                      "detail",
                                      "Unknown method or unsupported protocol.",
@@ -463,7 +467,7 @@ BAD_REQUEST_ERROR:
                 log_message (LOG_INFO, "Unknown method (%s) or protocol (%s)",
                              request->method, url);
                 goto fail;
-#endif
+                }
         }
 
 #ifdef FILTER_ENABLE
@@ -471,22 +475,16 @@ BAD_REQUEST_ERROR:
          * Filter restricted domains/urls
          */
         if (config->filter) {
-                if (config->filter_url)
-                        ret = filter_run (url);
-                else
-                        ret = filter_run (request->host);
+                int fu = config->filter_opts & FILTER_OPT_URL;
+                ret = filter_run (fu ? url : request->host);
 
                 if (ret) {
                         update_stats (STAT_DENIED);
 
-                        if (config->filter_url)
-                                log_message (LOG_NOTICE,
-                                             "Proxying refused on filtered url \"%s\"",
-                                             url);
-                        else
-                                log_message (LOG_NOTICE,
-                                             "Proxying refused on filtered domain \"%s\"",
-                                             request->host);
+                        log_message (LOG_NOTICE,
+                                     "Proxying refused on filtered %s \"%s\"",
+                                     fu ? "url" : "domain",
+                                     fu ? url : request->host);
 
                         indicate_http_error (connptr, 403, "Filtered",
                                              "detail",
@@ -781,7 +779,7 @@ static int remove_connection_headers (orderedmap hashofheaders)
         char *data;
         char *ptr;
         ssize_t len;
-        int i;
+        int i,j,df;
 
         for (i = 0; i != (sizeof (headers) / sizeof (char *)); ++i) {
                 /* Look for the connection header.  If it's not found, return. */
@@ -806,7 +804,12 @@ static int remove_connection_headers (orderedmap hashofheaders)
                  */
                 ptr = data;
                 while (ptr < data + len) {
-                        orderedmap_remove (hashofheaders, ptr);
+                        df = 0;
+                        /* check that ptr isn't one of headers to prevent
+                           double-free (CVE-2023-49606) */
+                        for (j = 0; j != (sizeof (headers) / sizeof (char *)); ++j)
+                                if(!strcasecmp(ptr, headers[j])) df = 1;
+                        if (!df) orderedmap_remove (hashofheaders, ptr);
 
                         /* Advance ptr to the next token */
                         ptr += strlen (ptr) + 1;
@@ -878,15 +881,14 @@ write_via_header (int fd, orderedmap hashofheaders,
         data = orderedmap_find (hashofheaders, "via");
         if (data) {
                 ret = write_message (fd,
-                                     "Via: %s, %hu.%hu %s (%s/%s)\r\n",
-                                     data, major, minor, hostname, PACKAGE,
-                                     VERSION);
+                                     "Via: %s, %hu.%hu %s (%s)\r\n",
+                                     data, major, minor, hostname, PACKAGE);
 
                 orderedmap_remove (hashofheaders, "via");
         } else {
                 ret = write_message (fd,
-                                     "Via: %hu.%hu %s (%s/%s)\r\n",
-                                     major, minor, hostname, PACKAGE, VERSION);
+                                     "Via: %hu.%hu %s (%s)\r\n",
+                                     major, minor, hostname, PACKAGE);
         }
 
 done:
@@ -1284,6 +1286,7 @@ static void relay_connection (struct conn_s *connptr)
         return;
 }
 
+#ifdef UPSTREAM_SUPPORT
 static int
 connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 {
@@ -1400,7 +1403,7 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 
 	return establish_http_connection(connptr, request);
 }
-
+#endif
 
 /*
  * Establish a connection to the upstream proxy server.
@@ -1556,6 +1559,19 @@ static void handle_connection_failure(struct conn_s *connptr, int got_headers)
         }
 }
 
+static void auth_error(struct conn_s *connptr, int code) {
+        const char *tit = code == 401 ? "Unauthorized" : "Proxy Authentication Required";
+        const char *msg = code == 401 ?
+        "The administrator of this proxy has not configured it to service requests from you." :
+        "This proxy requires authentication.";
+
+        update_stats (STAT_DENIED);
+        log_message (LOG_INFO,
+                     "Failed auth attempt (file descriptor: %d), ip %s",
+                     connptr->client_fd,
+                     connptr->client_ip_addr);
+        indicate_http_error (connptr, code, tit, "detail", msg, NULL);
+}
 
 /*
  * This is the main drive for each connection. As you can tell, for the
@@ -1628,11 +1644,7 @@ void handle_connection (struct conn_s *connptr, union sockaddr_union* addr)
 
         if (read_request_line (connptr) < 0) {
                 update_stats (STAT_BADCONN);
-                indicate_http_error (connptr, 408, "Timeout",
-                                     "detail",
-                                     "Server timeout waiting for the HTTP request "
-                                     "from the client.", NULL);
-                HC_FAIL();
+                goto done;
         }
 
         /*
@@ -1678,12 +1690,7 @@ void handle_connection (struct conn_s *connptr, union sockaddr_union* addr)
                 }
 
                 if (!authstring) {
-                        if (stathost_connect) goto e401;
-                        update_stats (STAT_DENIED);
-                        indicate_http_error (connptr, 407, "Proxy Authentication Required",
-                                             "detail",
-                                             "This proxy requires authentication.",
-                                             NULL);
+                        auth_error(connptr, stathost_connect ? 401 : 407);
                         HC_FAIL();
                 }
                 if ( /* currently only "basic" auth supported */
@@ -1692,13 +1699,7 @@ void handle_connection (struct conn_s *connptr, union sockaddr_union* addr)
                         basicauth_check (config->basicauth_list, authstring + 6) == 1)
                                 failure = 0;
                 if(failure) {
-e401:
-                        update_stats (STAT_DENIED);
-                        indicate_http_error (connptr, 401, "Unauthorized",
-                                             "detail",
-                                             "The administrator of this proxy has not configured "
-                                             "it to service requests from you.",
-                                             NULL);
+                        auth_error(connptr, stathost_connect ? 401 : 407);
                         HC_FAIL();
                 }
                 orderedmap_remove (hashofheaders, "proxy-authorization");
@@ -1772,10 +1773,10 @@ e401:
                         HC_FAIL();
                 }
         } else {
-                if (send_ssl_response (connptr) < 0) {
+                if (send_connect_method_response (connptr) < 0) {
                         log_message (LOG_ERR,
-                                     "handle_connection: Could not send SSL greeting "
-                                     "to client.");
+                                     "handle_connection: Could not send CONNECT"
+                                     " method greeting to client.");
                         update_stats (STAT_BADCONN);
                         HC_FAIL();
                 }

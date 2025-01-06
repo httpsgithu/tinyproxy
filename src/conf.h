@@ -39,6 +39,7 @@ typedef struct {
  */
 struct config_s {
         sblist *basicauth_list;
+        char *basicauth_realm;
         char *logf_name;
         unsigned int syslog;    /* boolean */
         unsigned int port;
@@ -50,9 +51,7 @@ struct config_s {
         sblist *listen_addrs;
 #ifdef FILTER_ENABLE
         char *filter;
-        unsigned int filter_url;        /* boolean */
-        unsigned int filter_extended;   /* boolean */
-        unsigned int filter_casesensitive;      /* boolean */
+        unsigned int filter_opts; /* enum filter_options */
 #endif                          /* FILTER_ENABLE */
 #ifdef XTINYPROXY_ENABLE
         unsigned int add_xtinyproxy; /* boolean */
